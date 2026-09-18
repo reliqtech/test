@@ -1,0 +1,233 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Mono Transfer — Encoder</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { margin: 0; font: 14px system-ui, sans-serif; background:#111; color:#eee; }
+  #bar { padding: 10px 14px; display:flex; flex-wrap:wrap; gap:12px; align-items:center; background:#1b1b1b; }
+  #bar label { display:flex; gap:6px; align-items:center; }
+  input[type=number]{ width:64px; }
+  button { padding:6px 12px; cursor:pointer; }
+  #stage { display:flex; flex-direction:column; align-items:center; justify-content:center; padding:20px; }
+  /* Pure black/white, no anti-aliasing — critical for the codec surviving video compression */
+  #qr { image-rendering: pixelated; background:#fff; }
+  #info { margin-top:10px; color:#aaa; font-variant-numeric: tabular-nums; }
+  .hint { color:#888; font-size:12px; max-width:900px; padding:0 14px 14px; }
+</style>
+
+<div id="bar">
+  <input type="file" id="file">
+  <span>или</span>
+  <input type="text" id="text" placeholder="вставь текст…" size="24">
+  <label>режим
+    <select id="mode">
+      <option value="f" selected>fountain (LT)</option>
+      <option value="p">plain (по кругу)</option>
+    </select>
+  </label>
+  <label>байт/кадр <input type="number" id="chunk" value="100" min="16" max="1000"></label>
+  <label>ECC
+    <select id="ecc">
+      <option value="L">L (7%)</option>
+      <option value="M">M (15%)</option>
+      <option value="Q" selected>Q (25%)</option>
+      <option value="H">H (30%)</option>
+    </select>
+  </label>
+  <label>fps <input type="number" id="fps" value="5" min="1" max="30"></label>
+  <label>модуль px <input type="number" id="scale" value="10" min="3" max="30"></label>
+  <label>манифест каждые <input type="number" id="minterval" value="8" min="1"> кадр.</label>
+  <button id="start">Старт</button>
+  <button id="stop" disabled>Стоп</button>
+</div>
+
+<div id="stage">
+  <canvas id="qr"></canvas>
+  <div id="info">готов</div>
+</div>
+
+<div class="hint">
+  Шарь эту вкладку в Zoom (Share → окно/вкладка браузера, «Optimize for video» лучше не включать).
+  Держи модуль крупным (8–12&nbsp;px) и fps низким (3–6): так поток переживает сжатие и потерю кадров.
+  <b>fountain</b> — каждый кадр это XOR случайных блоков; приёмник собирает файл из любых ~1.3–1.5·K
+  кадров, неважно каких. <b>plain</b> — блоки по кругу, проще, но потерянный кадр ждёшь целый оборот.
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcode-generator/1.4.4/qrcode.min.js"></script>
+<script>
+// ================= общие с decoder.py примитивы =================
+const SCALE = 1 << 20;
+
+// CRC32 (стандартный, совместим с zlib.crc32 в Python)
+const CRC_TABLE = (() => {
+  const t = new Uint32Array(256);
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+    t[n] = c >>> 0;
+  }
+  return t;
+})();
+function crc32(bytes) {
+  let c = 0xFFFFFFFF;
+  for (let i = 0; i < bytes.length; i++) c = CRC_TABLE[(c ^ bytes[i]) & 0xFF] ^ (c >>> 8);
+  return (c ^ 0xFFFFFFFF) >>> 0;
+}
+function bytesToB64(bytes) {
+  let s = "";
+  for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
+  return btoa(s);
+}
+
+// Mulberry32 PRNG — ДОЛЖЕН побитово совпадать с decoder.py
+function mulberry32(seed) {
+  let a = seed >>> 0;
+  return function () {
+    a = (a + 0x6D2B79F5) >>> 0;
+    let x = (a ^ (a >>> 15)) >>> 0;
+    let y = (1 | a) >>> 0;
+    let t = Math.imul(x, y) >>> 0;
+    let inner = Math.imul((t ^ (t >>> 7)) >>> 0, (61 | t) >>> 0) >>> 0;
+    t = (((t + inner) >>> 0) ^ t) >>> 0;
+    return (t ^ (t >>> 14)) >>> 0;
+  };
+}
+
+// Распределение степеней LT (только целочисленно → одинаково в JS и Python)
+function degreeCum(K) {
+  const w = new Array(K + 1).fill(0);
+  w[1] = Math.floor(SCALE / K) + Math.floor(SCALE / 10);   // degree-1 boost
+  for (let d = 2; d <= K; d++) w[d] = Math.floor(SCALE / (d * (d - 1)));
+  const d0 = Math.floor(K / 10);                            // mid coverage spike
+  if (d0 >= 2 && d0 <= K) w[d0] += Math.floor(SCALE / 20);
+  const cum = new Array(K + 1).fill(0);
+  let s = 0;
+  for (let d = 1; d <= K; d++) { s += w[d]; cum[d] = s; }
+  return { cum, total: s };
+}
+function symbolIndices(seed, K, cum, total) {
+  if (K === 1) return [0];
+  const rnd = mulberry32(seed);
+  const u = rnd() % total;
+  let d = 1;
+  while (d < K && cum[d] <= u) d++;
+  const picks = [];
+  while (picks.length < d) {
+    const idx = rnd() % K;
+    if (picks.indexOf(idx) === -1) picks.push(idx);
+  }
+  return picks;
+}
+
+// самопроверка PRNG: должно совпасть с эталоном из Python
+(() => {
+  const g = mulberry32(12345);
+  const got = [], ref = [4207900869, 1317490944, 2079646450, 3513001552,
+                        2187978186, 1492380277, 316786230, 3291647763];
+  for (let i = 0; i < 8; i++) got.push(g());
+  if (got.join() !== ref.join())
+    console.error("PRNG MISMATCH! encoder/decoder разойдутся:", got);
+  else console.log("PRNG self-check ok");
+})();
+
+// ================= состояние =================
+const els = id => document.getElementById(id);
+const canvas = els("qr"), ctx = canvas.getContext("2d");
+ctx.imageSmoothingEnabled = false;
+
+let timer = null, mode = "f";
+let blocks = [], K = 0, B = 0, cum = null, total = 0;
+let manifestStr = "";
+let seedCounter = 0, plainIdx = 0, frameCounter = 0, minterval = 8;
+
+function prepare(bytes, filename) {
+  mode = els("mode").value;
+  B = Math.max(16, parseInt(els("chunk").value) || 100);
+  K = Math.max(1, Math.ceil(bytes.length / B));
+  minterval = Math.max(1, parseInt(els("minterval").value) || 8);
+  // блоки фиксированной длины B (последний дополнен нулями)
+  blocks = [];
+  for (let i = 0; i < K; i++) {
+    const b = new Uint8Array(B);
+    b.set(bytes.subarray(i * B, Math.min((i + 1) * B, bytes.length)));
+    blocks.push(b);
+  }
+  const crc = crc32(bytes).toString(16).padStart(8, "0");
+  manifestStr = `M|${mode}|${K}|${B}|${crc}|${bytes.length}|${encodeURIComponent(filename)}`;
+  if (mode === "f") ({ cum, total } = degreeCum(K));
+  seedCounter = 0; plainIdx = 0; frameCounter = 0;
+}
+
+function nextPayload() {
+  if (frameCounter % minterval === 0) { frameCounter++; return manifestStr; }
+  frameCounter++;
+  if (mode === "p") {
+    const i = plainIdx % K; plainIdx++;
+    return `D|${i}|${bytesToB64(blocks[i])}`;
+  }
+  const seed = seedCounter++;
+  const v = new Uint8Array(B);
+  for (const i of symbolIndices(seed, K, cum, total)) {
+    const b = blocks[i];
+    for (let k = 0; k < B; k++) v[k] ^= b[k];
+  }
+  return `D|${seed}|${bytesToB64(v)}`;
+}
+
+function drawFrame(payload) {
+  const ecc = els("ecc").value;
+  const scale = Math.max(3, parseInt(els("scale").value) || 10);
+  const qr = qrcode(0, ecc);            // typeNumber 0 = авто-подбор версии
+  qr.addData(payload);                  // byte-mode
+  qr.make();
+  const n = qr.getModuleCount();
+  const quiet = 4;
+  const dim = (n + quiet * 2) * scale;
+  canvas.width = dim; canvas.height = dim;
+  ctx.imageSmoothingEnabled = false;
+  ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, dim, dim);
+  ctx.fillStyle = "#000";
+  for (let r = 0; r < n; r++)
+    for (let c = 0; c < n; c++)
+      if (qr.isDark(r, c))
+        ctx.fillRect((c + quiet) * scale, (r + quiet) * scale, scale, scale);
+  return n;
+}
+
+function tick() {
+  const payload = nextPayload();
+  const n = drawFrame(payload);
+  const head = payload[0] === "M"
+    ? "манифест"
+    : (mode === "f" ? `symbol seed=${seedCounter - 1}` : `block ${plainIdx - 1}/${K}`);
+  els("info").textContent = `${head} · K=${K} · QR ${n}×${n} модулей`;
+}
+
+function startWith(bytes, filename) {
+  prepare(bytes, filename);
+  const fps = Math.min(30, Math.max(1, parseInt(els("fps").value) || 5));
+  clearInterval(timer);
+  timer = setInterval(tick, 1000 / fps);
+  tick();
+  els("start").disabled = true; els("stop").disabled = false;
+}
+
+els("start").onclick = () => {
+  const f = els("file").files[0];
+  const txt = els("text").value;
+  if (f) {
+    const rd = new FileReader();
+    rd.onload = () => startWith(new Uint8Array(rd.result), f.name);
+    rd.readAsArrayBuffer(f);
+  } else if (txt) {
+    startWith(new TextEncoder().encode(txt), "text.txt");
+  } else {
+    alert("Выбери файл или введи текст");
+  }
+};
+els("stop").onclick = () => {
+  clearInterval(timer); timer = null;
+  els("start").disabled = false; els("stop").disabled = true;
+  els("info").textContent = "остановлено";
+};
+</script>
